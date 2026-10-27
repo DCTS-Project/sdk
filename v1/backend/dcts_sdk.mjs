@@ -2,40 +2,52 @@ import {sanitizeHTML, stripHTML} from "../../../modules/functions/sanitizing/fun
 import argon2 from "argon2";
 import {getMemberAccountById} from "../../../modules/functions/member.mjs";
 import {saveMemberToDB} from "../../../modules/functions/mysql/helper.mjs";
-import {serverconfig} from "../../../modules/functions/init/config.mjs";
+import {saveConfig, serverconfig} from "../../../modules/functions/init/config.mjs";
+import {addBan, removeBan} from "../../../modules/functions/ban-system/helpers.mjs";
+import {sendMessageToUser} from "../../../modules/functions/main.mjs";
+import {io} from "../../../modules/functions/init/sockets.mjs";
+import {getNewDate} from "../../../modules/functions/chat/main.mjs";
+import {addMute, removeMute} from "../../../modules/functions/mute-system/helpers.mjs";
+import {signer} from "../../../modules/functions/init/general.mjs";
 
 export default class DCTS {
     static Tools = new class {
+        Sockets = new class {
+            getSocketFromMemberId(memberId) {
+                if (!memberId) throw new Error("No member id provided")
+                return [...io.sockets.sockets.values()].find(socket => socket.memberId === memberId)?.memberId ?? null;
+            }
+        }
         Media = new class {
-            getInternalUrl(url){
-                if(!url) throw new Error("Missing url parameter");
+            getInternalUrl(url) {
+                if (!url) throw new Error("Missing url parameter");
 
                 const host = serverconfig?.serverinfo?.app?.url?.dcts;
-                if(!host) throw new Error("Missing host parameter in config! (serverinfo.app.url.dcts)");
+                if (!host) throw new Error("Missing host parameter in config! (serverinfo.app.url.dcts)");
 
                 const cleanUrl = String(url).trim();
                 const base = host.includes("://") ? host : `http://${host}`;
 
-                if(!cleanUrl.includes("://")){
+                if (!cleanUrl.includes("://")) {
                     return cleanUrl.startsWith("/") ? cleanUrl : `/${cleanUrl}`;
                 }
 
                 const parsed = new URL(cleanUrl);
                 const allowed = new URL(base);
 
-                if(parsed.host !== allowed.host) return cleanUrl;
+                if (parsed.host !== allowed.host) return cleanUrl;
 
                 return `${parsed.pathname}${parsed.search}${parsed.hash}`;
             }
 
-            getExternalUrl(url){
-                if(!url) throw new Error("Missing url parameter");
+            getExternalUrl(url) {
+                if (!url) throw new Error("Missing url parameter");
 
                 const host = serverconfig?.serverinfo?.app?.url?.dcts;
-                if(!host) throw new Error("Missing host parameter in config! (serverinfo.app.url.dcts)");
+                if (!host) throw new Error("Missing host parameter in config! (serverinfo.app.url.dcts)");
 
                 const cleanUrl = String(url).trim();
-                if(cleanUrl.includes("://")) return cleanUrl;
+                if (cleanUrl.includes("://")) return cleanUrl;
 
                 const base = host.includes("://") ? host : `http://${host}`;
                 return new URL(this.getInternalUrl(cleanUrl), base).href;
@@ -125,13 +137,6 @@ export default class DCTS {
     }
 
     static Members = new class {
-        async load(identifier, issuerId = null){
-            if(!identifier) throw new Error("Missing identifier!");
-            let account = await getMemberAccountById(identifier, issuerId)
-            if(account) this.data = {...account}
-            return new this.Builder(account);
-        }
-
         Builder = class extends DCTS.BaseBuilder {
             static validators = {
                 name: [value => typeof value === "string" && value.trim().length > 0 && value.length <= 20, "Name must be a string and max 20 char. long"],
@@ -186,10 +191,77 @@ export default class DCTS {
                 }
             }
 
-            async save(){
-                if(!this.data.id) throw new Error("missing member id!")
-                if(!this.data.token) throw new Error("missing member token!")
-                if(!this.data.loginName) throw new Error("missing login name!")
+            disconnect(reason = null) {
+                let socketId = DCTS.Tools.Sockets.getSocketFromMemberId(this.data.id);
+                if (!socketId) return {error: `No socket found with id ${this.data?.id}}`};
+
+                try {
+                    sendMessageToUser(socketId, {
+                        title: "You've been disconnected",
+                        message: reason ? `Reason:<br>${reason}` : "",
+                        buttons: {
+                            "0": {
+                                text: "Ok",
+                                events: "onclick='closeModal()'"
+                            }
+                        },
+                        type: "error",
+                        displayTime: 600000,
+                        wasDisconnected: true
+                    });
+
+                    io.sockets.sockets.get(socketId).disconnect();
+                } catch (ex) {
+                    return {error: ex}
+                }
+
+                return {error: null};
+            }
+
+            async unmute(...identifiers) {
+                identifiers = identifiers.filter(id => id !== undefined && id !== null);
+                if(identifiers?.length === 0) throw new Error("Identifier is required");
+                let result = await removeMute(...identifiers);
+                io.emit("updateMemberList");
+                return result;
+            }
+
+            async mute({
+                           issuerMemberId = "system",
+                           duration = "perma",
+                           reason = ""
+                       }) {
+
+                let muteResult = null;
+                if(this.data.publicKey){
+                    muteResult = await addMute({
+                        identifier: signer.normalizePublicKey(this.data.publicKey),
+                        issuerId: issuerMemberId,
+                        duration,
+                        reason,
+                    })
+                }
+                else if(this.data.id){
+                    muteResult = addMute({
+                        identifier: this.data.id,
+                        issuerId: issuerMemberId,
+                        duration,
+                        reason,
+                    })
+                }
+                else{
+                    throw new Error("Neighter a member id or public key was found")
+                }
+
+                this.save();
+                io.emit("updateMemberList");
+                return muteResult;
+            }
+
+            async save() {
+                if (!this.data.id) throw new Error("missing member id!")
+                if (!this.data.token) throw new Error("missing member token!")
+                if (!this.data.loginName) throw new Error("missing login name!")
 
                 await saveMemberToDB(this.data.id, this.data);
 
@@ -198,6 +270,42 @@ export default class DCTS {
                     ...serverconfig.servermembers[this.data.id],
                     ...this.data
                 }
+
+                return true;
+            }
+
+            async unban(identifier) {
+                let result = null;
+                if (this.data.publicKey) {
+                    result = await removeBan(identifier)
+                }
+                if (this.data.id) {
+                    result = await removeBan(identifier)
+                }
+
+                return result;
+            }
+
+            async ban({bannedBy = "system", reason = "", until = -1}) {
+                let result = null;
+                if (this.data.publicKey) {
+                    result = await addBan({
+                        identifier: this.data.publicKey,
+                        bannedBy,
+                        reason,
+                        until
+                    })
+                }
+                if (this.data.id) {
+                    result = await addBan({
+                        identifier: this.data.id,
+                        bannedBy,
+                        reason,
+                        until
+                    })
+                }
+
+                return result;
             }
 
             setOnboarding(boolean) {
@@ -206,10 +314,6 @@ export default class DCTS {
 
             setVerifiedKey(boolean) {
                 return this.setValue("isVerifiedKey", !!boolean);
-            }
-
-            setMuted(boolean) {
-                return this.setValue("isMuted", !!boolean);
             }
 
             setBanned(boolean) {
@@ -277,6 +381,13 @@ export default class DCTS {
             setType(content) {
                 return this.setValue("type", content);
             }
+        }
+
+        async load(identifier, issuerId = null) {
+            if (!identifier) throw new Error("Missing identifier!");
+            let account = await getMemberAccountById(identifier, issuerId)
+            if (account) this.data = {...account}
+            return new this.Builder(account);
         }
     }
 
